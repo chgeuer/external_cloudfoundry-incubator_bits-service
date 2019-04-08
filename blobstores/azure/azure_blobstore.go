@@ -171,34 +171,18 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 		uncommittedBlocksList[i] = blockIDfromIndex(i)
 	}
 
-	uploadSingleBlock := func(ctx context.Context, blobstore *Blobstore, temporaryBlob a.BlockBlobURL, l *zap.SugaredLogger, bytesToUpload []byte, i int) error {
-		blockID := blockIDfromIndex(i)
-
-		checkSumMD5 := md5.New()
-		checkSumMD5.Write(bytesToUpload)
-		blockMD5bytes := checkSumMD5.Sum(nil)
-		length := len(bytesToUpload)
-
-		t1 := time.Now()
-		body := filebuffer.New(bytesToUpload)
-		response, err := temporaryBlob.StageBlock(ctx, blockID, body, a.LeaseAccessConditions{}, blockMD5bytes)
-		duration := time.Since(t1).Seconds()
-		l.Debugw("Put", "i", i, "azure-upload-bytes", length, "azure-upload-duration", duration, "azure-upload-throughput", fmt.Sprintf("%.2f MB/sec", float64(length)/(duration*megaByte)), "status", response.Status())
-		return err
-	}
-
-	expectedByteCount := func(i int) int {
-		if i < numberOfBlocks-1 {
-			return blobstore.putBlockSize
-		}
-		return int(sourceContentLength % int64(blobstore.putBlockSize))
-	}
-
 	data := make([]byte, blobstore.putBlockSize)
 	for i := 0; i <= numberOfBlocks; i++ {
+		expectedByteCount := func() int {
+			if i < numberOfBlocks-1 {
+				return blobstore.putBlockSize
+			}
+			return int(sourceContentLength % int64(blobstore.putBlockSize))
+		}()
+
 		t1 := time.Now()
 		// make sure we upload full blocks to Azure storage
-		numBytesRead, e := io.ReadAtLeast(src, data, expectedByteCount(i))
+		numBytesRead, e := io.ReadAtLeast(src, data, expectedByteCount)
 		duration := time.Since(t1).Seconds()
 		l.Debugw("Put", "i", i, "disk-read-bytes", numBytesRead, "disk-read-duration", duration, "disk-read-throughput", fmt.Sprintf("%.2f MB/s", float64(numBytesRead)/(duration*megaByte)))
 
@@ -212,7 +196,7 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 		bytesToUpload := data[:numBytesRead]
 		cloned := append(bytesToUpload[:0:0], bytesToUpload...)
 		overallMD5.Write(cloned)
-		if putBlockErr := uploadSingleBlock(ctx, blobstore, temporaryBlob, l, cloned, i); err != nil {
+		if putBlockErr := uploadSingleBlock(ctx, blobstore, temporaryBlob, l, cloned, i); putBlockErr != nil {
 			return wrapWithAzureDetails(putBlockErr, fmt.Sprintf("PutBlock() failed. path: %v, pathWithRequestIDSuffix : %v, put-request-id: %v", path, pathWithRequestIDSuffix, putRequestID))
 		}
 	}
@@ -259,6 +243,22 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 	l.Debugw("Copy", "source-blob", temporaryBlob, "destination-blob", blob)
 
 	return nil
+}
+
+func uploadSingleBlock(ctx context.Context, blobstore *Blobstore, temporaryBlob a.BlockBlobURL, l *zap.SugaredLogger, bytesToUpload []byte, i int) error {
+	blockID := blockIDfromIndex(i)
+
+	checkSumMD5 := md5.New()
+	checkSumMD5.Write(bytesToUpload)
+	blockMD5bytes := checkSumMD5.Sum(nil)
+	length := len(bytesToUpload)
+
+	t1 := time.Now()
+	body := filebuffer.New(bytesToUpload)
+	response, err := temporaryBlob.StageBlock(ctx, blockID, body, a.LeaseAccessConditions{}, blockMD5bytes)
+	duration := time.Since(t1).Seconds()
+	l.Debugw("Put", "i", i, "azure-upload-bytes", length, "azure-upload-duration", duration, "azure-upload-throughput", fmt.Sprintf("%.2f MB/sec", float64(length)/(duration*megaByte)), "status", response.Status())
+	return err
 }
 
 func (blobstore *Blobstore) Copy(src, dest string) error {
