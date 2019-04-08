@@ -187,10 +187,18 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 		return err
 	}
 
+	expectedByteCount := func(i int) int {
+		if i < numberOfBlocks-1 {
+			return blobstore.putBlockSize
+		}
+		return int(sourceContentLength % int64(blobstore.putBlockSize))
+	}
+
 	data := make([]byte, blobstore.putBlockSize)
 	for i := 0; i <= numberOfBlocks; i++ {
 		t1 := time.Now()
-		numBytesRead, e := src.Read(data)
+		// make sure we upload full blocks to Azure storage
+		numBytesRead, e := io.ReadAtLeast(src, data, expectedByteCount(i))
 		duration := time.Since(t1).Seconds()
 		l.Debugw("Put", "i", i, "disk-read-bytes", numBytesRead, "disk-read-duration", duration, "disk-read-throughput", fmt.Sprintf("%.2f MB/s", float64(numBytesRead)/(duration*megaByte)))
 
@@ -199,11 +207,6 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 			break
 		} else if e != nil {
 			return errors.Wrapf(e, "put block failed. path: %v, put-request-id: %v", path, putRequestID)
-		} else if i < numberOfBlocks-1 && numBytesRead != blobstore.putBlockSize {
-			// we're not at the last block, but we also didn't get a full block
-			curr, _ := src.Seek(0, io.SeekCurrent)
-			e = fmt.Errorf("The io.Reader.read() operation didn't return a full block of data. Position in stream %d, with %d bytes read, expected %d bytes", curr, numBytesRead, blobstore.putBlockSize)
-			return errors.Wrapf(e, "PutBlock() failed. path: %v, pathWithRequestIDSuffix : %v, put-request-id: %v", path, pathWithRequestIDSuffix, putRequestID)
 		}
 
 		bytesToUpload := data[:numBytesRead]
