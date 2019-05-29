@@ -134,7 +134,6 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 	// If upload is needed, do the following:
 	// It can happen that multiple clients request uploads into the same blob.
 	// To prevent collisions, each client uploads to a unique file first, then copies to the final blob, and deletes the original upload.
-	// The copy operation is protected by a blob lease
 	//
 	var (
 		putRequestID = rand.Int63()
@@ -213,30 +212,8 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 	}()
 
 	blob := blobstore.containerURL.NewBlockBlobURL(path)
-	var empty [0]byte
-	buf := filebuffer.New(empty[:])
-	if createEmptyResponse, e := blob.Upload(ctx, buf, a.BlobHTTPHeaders{}, a.Metadata{}, a.BlobAccessConditions{}); e != nil {
-		if azse, ok := e.(a.StorageError); ok && azse.ServiceCode() == a.ServiceCodeLeaseIDMissing {
-			return blobstore.handleError(azse, "Another upload is in progress for blob %s/%s (x-ms-request-id %s)", blobstore.containerName, path, createEmptyResponse.RequestID())
-		}
-		return errors.Wrapf(e, "CreateBlockBlob() failed. container: %v, path: %v, put-request-id: %v", blobstore.containerName, path, putRequestID)
-	}
-
-	lease := blobstore.newBlobLease(-1*time.Second, blob) // -1 is infinity
-	if err := lease.acquire(l); err != nil {
-		return err
-	}
-	defer func() {
-		if err := lease.release(); err != nil {
-			l.Errorf("Error during lease handling: %s", err)
-		}
-		l.Debugw("ReleaseLease", "lease-id", lease.LeaseID)
-	}()
-	l.Debugw("AcquireLease", "lease-id", lease.LeaseID)
-
 	if _, copyErr := blob.StartCopyFromURL(
-		ctx, temporaryBlob.URL(), a.Metadata{}, a.ModifiedAccessConditions{},
-		a.BlobAccessConditions{LeaseAccessConditions: a.LeaseAccessConditions{LeaseID: lease.LeaseID}},
+		ctx, temporaryBlob.URL(), a.Metadata{}, a.ModifiedAccessConditions{}, a.BlobAccessConditions{},
 	); copyErr != nil {
 		return wrapWithAzureDetails(copyErr, fmt.Sprintf("Copy() failed. path: %v, pathWithRequestIDSuffix : %v", path, pathWithRequestIDSuffix))
 	}
@@ -460,73 +437,4 @@ func debugBlockIDAsString(l []string) string {
 	} else {
 		return fmt.Sprintf("[%v, ..., %v] (%d blocks overall)", l[0], l[length-1], length)
 	}
-}
-
-type azureBlobLease struct {
-	Duration     time.Duration
-	Blobstore    *Blobstore
-	Blob         a.BlockBlobURL
-	LeaseID      string
-	DoneChannel  chan bool
-	ErrorChannel chan error
-}
-
-func (blobstore *Blobstore) newBlobLease(duration time.Duration, blob a.BlockBlobURL) *azureBlobLease {
-	return &azureBlobLease{
-		DoneChannel:  make(chan bool, 1),
-		ErrorChannel: make(chan error, 1),
-		Duration:     duration,
-		Blobstore:    blobstore,
-		Blob:         blob,
-		LeaseID:      "",
-	}
-}
-
-func (l *azureBlobLease) acquire(logger *zap.SugaredLogger) error {
-	leaseDurationInSeconds := int32(l.Duration.Seconds())
-	proposedID := ""
-	response, err := l.Blob.AcquireLease(l.Blobstore.ctx, proposedID, leaseDurationInSeconds, a.ModifiedAccessConditions{})
-	if err != nil {
-		if azse, ok := err.(a.StorageError); ok && azse.ServiceCode() == a.ServiceCodeLeaseIDMissing {
-			return l.Blobstore.handleError(azse, "Another upload is in progress for blob %s", l.Blob)
-		}
-		return err
-	}
-
-	l.LeaseID = response.LeaseID()
-	go func(l *azureBlobLease) {
-		if l.Duration.Seconds() == -1 {
-			// for an infinite lease, wait for the DoneChannel and release it
-			_ = <-l.DoneChannel
-			_, releaseErr := l.Blob.ReleaseLease(l.Blobstore.ctx, l.LeaseID, a.ModifiedAccessConditions{})
-			l.ErrorChannel <- releaseErr
-			return
-		} else {
-			for {
-				select {
-				case done := <-l.DoneChannel:
-					if !done {
-					}
-					_, releaseErr := l.Blob.ReleaseLease(l.Blobstore.ctx, l.LeaseID, a.ModifiedAccessConditions{})
-					l.ErrorChannel <- releaseErr
-					return
-				case <-time.After(l.Duration):
-					_, renewLeaseErr := l.Blob.RenewLease(l.Blobstore.ctx, l.LeaseID, a.ModifiedAccessConditions{})
-					if renewLeaseErr != nil {
-						logger.Errorf("Error during RenewLease: %s", renewLeaseErr)
-					}
-				}
-			}
-		}
-	}(l)
-
-	return nil
-}
-
-func (l *azureBlobLease) release() error {
-	if l.LeaseID == "" {
-		return fmt.Errorf("Lease was not properly created")
-	}
-	l.DoneChannel <- true
-	return <-l.ErrorChannel
 }
